@@ -1,0 +1,11 @@
+{
+  "name": "claude-mods",
+  "owner": { "name": "sc-claw" },
+  "plugins": [
+    {
+      "name": "usage-limit",
+      "source": "./plugins/usage-limit",
+      "description": "Shows context fill, 5h / 7d usage limits, reset countdowns and a time-to-limit forecast above the prompt"
+    }
+  ]
+}
