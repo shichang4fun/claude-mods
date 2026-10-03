@@ -1,6 +1,6 @@
 {
   "name": "usage-limit",
-  "version": "0.1.0",
+  "version": "0.3.5",
   "author": { "name": "sc-claw" },
   "description": "Shows 5h / 7d usage limits with reset countdowns above the prompt",
   "types": "./types/index.d.ts"
