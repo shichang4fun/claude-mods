@@ -6,6 +6,11 @@
       "name": "usage-limit",
       "source": "./plugins/usage-limit",
       "description": "Shows context fill, 5h / 7d usage limits, reset countdowns and a time-to-limit forecast above the prompt"
+    },
+    {
+      "name": "next-steps-desktop",
+      "source": "./plugins/next-steps-desktop",
+      "description": "Suggests up to three next prompts after each turn; click to send (desktop) or draft (terminal), or copy to edit first"
     }
   ]
 }
