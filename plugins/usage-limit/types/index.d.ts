@@ -3,6 +3,6 @@ export type Sample = { t: number; p: number }
 
 declare module 'claude-code' {
   interface PluginState {
-    'usage-limit': { limits: Limit[]; contextPercent: number | null; samples: Sample[] }
+    'usage-limit': { limits: Limit[]; contextPercent: number | null; samples: Sample[]; speed: number | null }
   }
 }

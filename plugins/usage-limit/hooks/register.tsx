@@ -7,6 +7,8 @@ const limits = atom({ plugin: 'usage-limit', key: 'limits' } as const, [])
 const contextPercent = atom({ plugin: 'usage-limit', key: 'contextPercent' } as const, null)
 // five_hour readings over the last SAMPLE_SPAN, for the time-to-limit forecast
 const samples = atom({ plugin: 'usage-limit', key: 'samples' } as const, [])
+// output tokens per second of the main conversation's last finished response
+const speed = atom({ plugin: 'usage-limit', key: 'speed' } as const, null)
 
 const HOUR = 3_600_000
 const WINDOWS: Record<string, { label: string; ms?: number; showsClock?: boolean }> = {
@@ -21,6 +23,9 @@ const MIN_SPAN = 3 * 60_000
 const TICK_MS = 60_000
 // reset clock times are shown in UTC+8
 const CLOCK_OFFSET = 8 * HOUR
+// responses shorter than this are too brief to time cleanly
+const MIN_SPEED_MS = 1000
+const MIN_SPEED_TOKENS = 20
 
 // Layout
 const BAR_CELLS = 10
@@ -43,6 +48,8 @@ type Meter = {
   reset: string | null
   clock: string | null
   warning: string | null
+  // a plain figure (tok/s) draws no bar
+  noBar?: boolean
 }
 
 let ticker: { cancel: () => void } | null = null
@@ -131,6 +138,7 @@ const CHIP_THEMES: Record<string, { tint: string; accent: string; accentDark: st
   ctx: { tint: 'rgba(70,130,240,0.16)', accent: '#3d72d6', accentDark: '#7aa5f5', icon: 'layers' },
   five_hour: { tint: 'rgba(76,175,80,0.16)', accent: '#3f8f43', accentDark: '#6cc070', icon: 'gauge' },
   seven_day: { tint: 'rgba(124,92,230,0.16)', accent: '#6d4fd6', accentDark: '#a48cf5', icon: 'calendar' },
+  speed: { tint: 'rgba(224,165,38,0.18)', accent: '#b07d10', accentDark: '#f0c050', icon: 'zap' },
 }
 const ICONS: Record<string, string> = {
   gauge: '<path d="m12 14 4-4"/><path d="M3.34 19a10 10 0 1 1 17.32 0"/>',
@@ -138,6 +146,7 @@ const ICONS: Record<string, string> = {
   layers:
     '<path d="m12.83 2.18a2 2 0 0 0-1.66 0L2.6 6.08a1 1 0 0 0 0 1.83l8.58 3.91a2 2 0 0 0 1.66 0l8.58-3.9a1 1 0 0 0 0-1.83Z"/><path d="m22 17.65-9.17 4.16a2 2 0 0 1-1.66 0L2 17.65"/><path d="m22 12.65-9.17 4.16a2 2 0 0 1-1.66 0L2 12.65"/>',
   history: '<path d="M3 12a9 9 0 1 0 9-9 9.75 9.75 0 0 0-6.74 2.74L3 8"/><path d="M3 3v5h5"/><path d="M12 7v5l4 2"/>',
+  zap: '<path d="M4 14a1 1 0 0 1-.78-1.63l9.9-10.2a.5.5 0 0 1 .86.46l-1.92 6.02A1 1 0 0 0 13 10h7a1 1 0 0 1 .78 1.63l-9.9 10.2a.5.5 0 0 1-.86-.46l1.92-6.02A1 1 0 0 0 11 14z"/>',
 }
 
 // Monospace advance: ASCII is 0.6em, anything wider (⚠, CJK) taken as a full em, plus letter-spacing
@@ -166,17 +175,19 @@ function chipSvg(m: Meter) {
   parts.push(`<text x="${x}" y="${base}" class="muted">${esc(m.label)}</text>`)
   x += textWidth(m.label) + GAP
 
-  const barY = mid - BAR_H / 2
-  const fill = Math.round((clamp(m.used) / 100) * BAR_W)
-  parts.push(`<clipPath id="b"><rect x="${x}" y="${barY}" width="${BAR_W}" height="${BAR_H}" rx="${BAR_H / 2}"/></clipPath>`)
-  parts.push(`<g clip-path="url(#b)"><rect x="${x}" y="${barY}" width="${BAR_W}" height="${BAR_H}" fill="${SVG_COLORS.track}"/>`)
-  if (fill > 0) parts.push(`<rect x="${x}" y="${barY}" width="${fill}" height="${BAR_H}" fill="${SVG_COLORS[m.tone]}"/>`)
-  parts.push('</g>')
-  if (m.elapsed !== null) {
-    const mx = x + Math.min(BAR_W - 2, Math.max(0, Math.round((m.elapsed / 100) * BAR_W) - 1))
-    parts.push(`<rect x="${mx}" y="${mid - 4}" width="1.5" height="8" rx="1" class="ink-fill"/>`)
+  if (!m.noBar) {
+    const barY = mid - BAR_H / 2
+    const fill = Math.round((clamp(m.used) / 100) * BAR_W)
+    parts.push(`<clipPath id="b"><rect x="${x}" y="${barY}" width="${BAR_W}" height="${BAR_H}" rx="${BAR_H / 2}"/></clipPath>`)
+    parts.push(`<g clip-path="url(#b)"><rect x="${x}" y="${barY}" width="${BAR_W}" height="${BAR_H}" fill="${SVG_COLORS.track}"/>`)
+    if (fill > 0) parts.push(`<rect x="${x}" y="${barY}" width="${fill}" height="${BAR_H}" fill="${SVG_COLORS[m.tone]}"/>`)
+    parts.push('</g>')
+    if (m.elapsed !== null) {
+      const mx = x + Math.min(BAR_W - 2, Math.max(0, Math.round((m.elapsed / 100) * BAR_W) - 1))
+      parts.push(`<rect x="${mx}" y="${mid - 4}" width="1.5" height="8" rx="1" class="ink-fill"/>`)
+    }
+    x += BAR_W + GAP
   }
-  x += BAR_W + GAP
 
   // the percentage stays in ink while on pace, and takes the warning color once it isn't
   const pctClass = m.tone === 'green' ? 'ink' : ''
@@ -239,7 +250,7 @@ function textBarRuns(used: number, elapsed: number | null) {
 // Whether every meter fits on one line with its text bar
 function barsFit(meters: Meter[], columns: number) {
   const width = meters.reduce(
-    (sum, m) => sum + m.label.length + 1 + BAR_CELLS + 1 + m.value.length + (m.reset ? m.reset.length + 3 : 0) + (m.clock ? m.clock.length + 1 : 0) + (m.warning ? m.warning.length + 2 : 0),
+    (sum, m) => sum + m.label.length + 1 + (m.noBar ? 0 : BAR_CELLS + 1) + m.value.length + (m.reset ? m.reset.length + 3 : 0) + (m.clock ? m.clock.length + 1 : 0) + (m.warning ? m.warning.length + 2 : 0),
     0,
   )
   return width + METER_GAP * (meters.length - 1) <= columns - 2
@@ -286,10 +297,32 @@ export const register: Register = on => {
     return next(e)
   })
 
+  // Times the main conversation's responses: output_tokens over the time from the first piece to the stop.
+  // Subagents run in parallel on their own models, so they are left out.
+  on('turn.step', async function* ($, e, next) {
+    if (e.agentId) return yield* next(e)
+    const stream = next(e)
+    let first: number | null = null
+    for await (const c of stream) {
+      const t = performance.now()
+      if (first === null) first = t
+      if (c.kind === 'stop' && c.usage) {
+        const ms = t - first
+        const tokens = c.usage.output_tokens
+        if (ms >= MIN_SPEED_MS && tokens >= MIN_SPEED_TOKENS) {
+          await update($, speed, () => tokens / (ms / 1000))
+        }
+      }
+      yield c
+    }
+    return await stream.result
+  })
+
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     const current: Limit[] = await read($, limits)
     const ctx = await read($, contextPercent)
-    if (e.props.hasSurvey || (current.length === 0 && ctx === null)) {
+    const rate = await read($, speed)
+    if (e.props.hasSurvey || (current.length === 0 && ctx === null && rate === null)) {
       return next(e)
     }
 
@@ -300,6 +333,10 @@ export const register: Register = on => {
       meters.push({ key: 'ctx', label: 'ctx', used: ctx, elapsed: null, tone: toneOf(ctx, null), value: `${ctx}%`, reset: null, clock: null, warning: null })
     }
     for (const limit of current) meters.push(limitMeter(limit, now, history))
+    if (rate !== null) {
+      const value = rate < 10 ? rate.toFixed(1) : String(Math.round(rate))
+      meters.push({ key: 'speed', label: 'tok/s', used: 0, elapsed: null, tone: 'green', value, reset: null, clock: null, warning: null, noBar: true })
+    }
 
     const elements = $.ui.resolve(e)
     const { Box, Text } = elements
@@ -326,7 +363,7 @@ export const register: Register = on => {
         {meters.map(m => (
           <Box key={`meter-${m.key}`} flexDirection="row" columnGap={1} alignItems="center">
             <Text>{m.label}</Text>
-            {gauge === 'text' ? (
+            {gauge === 'text' && !m.noBar ? (
               <Text>
                 {textBarRuns(m.used, m.elapsed).map((run, i) =>
                   run.kind === 'marker' ? (
