@@ -1,12 +1,10 @@
 import { atom, read, update } from 'claude-code'
-import type { EngineInterface, Register } from 'claude-code'
+import type { Register } from 'claude-code'
 
-import type { Limit, Sample } from '../types'
+import type { Limit } from '../types'
 
 const limits = atom({ plugin: 'usage-limit', key: 'limits' } as const, [])
 const contextPercent = atom({ plugin: 'usage-limit', key: 'contextPercent' } as const, null)
-// five_hour readings over the last SAMPLE_SPAN, for the time-to-limit forecast
-const samples = atom({ plugin: 'usage-limit', key: 'samples' } as const, [])
 // output tokens per second of the main conversation's last finished response
 const speed = atom({ plugin: 'usage-limit', key: 'speed' } as const, null)
 
@@ -17,8 +15,6 @@ const WINDOWS: Record<string, { label: string; ms?: number; showsClock?: boolean
   spend_limit: { label: '$' },
 }
 const WARN_AT = [80, 90]
-const SAMPLE_SPAN = 30 * 60_000
-const MIN_SPAN = 3 * 60_000
 // refreshes countdowns and the elapsed marker between measurements
 const TICK_MS = 60_000
 // reset clock times are shown in UTC+8
@@ -47,7 +43,6 @@ type Meter = {
   value: string
   reset: string | null
   clock: string | null
-  warning: string | null
   // a plain figure (tok/s) draws no bar
   noBar?: boolean
 }
@@ -81,46 +76,20 @@ function clock(ms: number) {
   return `${String(t.getUTCHours()).padStart(2, '0')}:${String(t.getUTCMinutes()).padStart(2, '0')}`
 }
 
-// ms until five_hour reaches 100% at the recent rate; null when flat or too few readings
-function timeToLimit(history: Sample[], percent: number) {
-  if (history.length < 2) return null
-  const first = history[0]
-  const last = history[history.length - 1]
-  const span = last.t - first.t
-  const rise = last.p - first.p
-  if (span < MIN_SPAN || rise <= 0) return null
-  return ((100 - percent) / rise) * span
-}
-
-async function recordSample($: EngineInterface, rateLimits: Limit[]) {
-  const five = rateLimits.find(l => l.kind === 'five_hour')
-  if (!five) return
-  const t = await $.clock.now()
-  await update($, samples, (prev: Sample[]) => {
-    const last = prev[prev.length - 1]
-    // a drop means the window reset: start over
-    const kept = last && five.percentUsed < last.p ? [] : prev.filter(s => t - s.t <= SAMPLE_SPAN)
-    return [...kept, { t, p: five.percentUsed }]
-  })
-}
-
-function limitMeter(limit: Limit, now: number, history: Sample[]): Meter {
+function limitMeter(limit: Limit, now: number): Meter {
   const win = WINDOWS[limit.kind]
   const label = win?.label ?? limit.kind
   const resetsAt = limit.resetsAt ? Date.parse(limit.resetsAt) : null
   // the window has reset since the last reading: it starts again from zero
   if (resetsAt !== null && resetsAt <= now) {
-    return { key: limit.kind, label, used: 0, elapsed: win?.ms ? 0 : null, tone: 'green', value: '0%', reset: null, clock: null, warning: null }
+    return { key: limit.kind, label, used: 0, elapsed: win?.ms ? 0 : null, tone: 'green', value: '0%', reset: null, clock: null }
   }
   const resetIn = resetsAt === null ? null : resetsAt - now
   const elapsed = win?.ms && resetIn !== null ? clamp(100 - (resetIn / win.ms) * 100) : null
   const value = `${Math.round(limit.percentUsed)}%`
   const reset = resetIn === null ? null : duration(resetIn)
   const at = resetsAt !== null && win?.showsClock ? `(${clock(resetsAt)})` : null
-  const eta = limit.kind === 'five_hour' ? timeToLimit(history, limit.percentUsed) : null
-  // only worth showing when the limit would arrive before the reset
-  const warning = eta !== null && (resetIn === null || eta < resetIn) ? `⚠ ≈${duration(eta)} 撞线` : null
-  return { key: limit.kind, label, used: limit.percentUsed, elapsed, tone: toneOf(limit.percentUsed, elapsed), value, reset, clock: at, warning }
+  return { key: limit.kind, label, used: limit.percentUsed, elapsed, tone: toneOf(limit.percentUsed, elapsed), value, reset, clock: at }
 }
 
 // Desktop chips: one SVG per meter (the band's Box has no rounded backgrounds), each a tinted
@@ -209,11 +178,6 @@ function chipSvg(m: Meter) {
     parts.push(`<text x="${x}" y="${base}" class="muted">${esc(m.clock)}</text>`)
     x += textWidth(m.clock)
   }
-  if (m.warning) {
-    x += GAP
-    parts.push(`<text x="${x}" y="${base}" font-weight="700" fill="${SVG_COLORS.red}">${esc(m.warning)}</text>`)
-    x += textWidth(m.warning)
-  }
   const width = Math.ceil(x + CHIP_PAD)
 
   const style =
@@ -250,7 +214,7 @@ function textBarRuns(used: number, elapsed: number | null) {
 // Whether every meter fits on one line with its text bar
 function barsFit(meters: Meter[], columns: number) {
   const width = meters.reduce(
-    (sum, m) => sum + m.label.length + 1 + (m.noBar ? 0 : BAR_CELLS + 1) + m.value.length + (m.reset ? m.reset.length + 3 : 0) + (m.clock ? m.clock.length + 1 : 0) + (m.warning ? m.warning.length + 2 : 0),
+    (sum, m) => sum + m.label.length + 1 + (m.noBar ? 0 : BAR_CELLS + 1) + m.value.length + (m.reset ? m.reset.length + 3 : 0) + (m.clock ? m.clock.length + 1 : 0),
     0,
   )
   return width + METER_GAP * (meters.length - 1) <= columns - 2
@@ -272,7 +236,6 @@ export const register: Register = on => {
     const usage = await $.session.usage()
     await update($, limits, () => usage.rateLimits)
     await update($, contextPercent, () => usage.context.percent ?? null)
-    await recordSample($, usage.rateLimits)
     ticker?.cancel()
     ticker = $.clock.every(TICK_MS, () => $.ui.invalidate('ui.render'))
     return next(e)
@@ -292,7 +255,6 @@ export const register: Register = on => {
         }
       }
       await update($, limits, () => e.rateLimits)
-      await recordSample($, e.rateLimits)
     }
     return next(e)
   })
@@ -327,15 +289,14 @@ export const register: Register = on => {
     }
 
     const now = await $.clock.now()
-    const history: Sample[] = await read($, samples)
     const meters: Meter[] = []
     if (ctx !== null) {
-      meters.push({ key: 'ctx', label: 'ctx', used: ctx, elapsed: null, tone: toneOf(ctx, null), value: `${ctx}%`, reset: null, clock: null, warning: null })
+      meters.push({ key: 'ctx', label: 'ctx', used: ctx, elapsed: null, tone: toneOf(ctx, null), value: `${ctx}%`, reset: null, clock: null })
     }
-    for (const limit of current) meters.push(limitMeter(limit, now, history))
+    for (const limit of current) meters.push(limitMeter(limit, now))
     if (rate !== null) {
       const value = rate < 10 ? rate.toFixed(1) : String(Math.round(rate))
-      meters.push({ key: 'speed', label: 'tok/s', used: 0, elapsed: null, tone: 'green', value, reset: null, clock: null, warning: null, noBar: true })
+      meters.push({ key: 'speed', label: 'tok/s', used: 0, elapsed: null, tone: 'green', value, reset: null, clock: null, noBar: true })
     }
 
     const elements = $.ui.resolve(e)
@@ -351,7 +312,7 @@ export const register: Register = on => {
             <Svg
               key={`chip-${m.key}`}
               source={chip.source}
-              alt={`${m.label} ${m.value}${m.reset ? `, resets in ${m.reset}` : ''}${m.elapsed === null ? '' : `, ${Math.round(m.elapsed)}% of the window gone`}${m.warning ? `, ${m.warning}` : ''}`}
+              alt={`${m.label} ${m.value}${m.reset ? `, resets in ${m.reset}` : ''}${m.elapsed === null ? '' : `, ${Math.round(m.elapsed)}% of the window gone`}`}
               width={chip.width}
               height={CHIP_H}
             />
@@ -379,7 +340,6 @@ export const register: Register = on => {
             <Text color={m.tone}>{m.value}</Text>
             {m.reset ? <Text color="cyan">↻ {m.reset}</Text> : null}
             {m.clock ? <Text dimColor>{m.clock}</Text> : null}
-            {m.warning ? <Text color="red" bold>{m.warning}</Text> : null}
           </Box>
         ))}
       </Box>
